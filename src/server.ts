@@ -37,7 +37,7 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
 
 const server = app.listen(PORT, async () => {
   await refreshEurUsdRate();
-  logger.info({ port: PORT }, "Kraken API started");
+  logger.info({ port: PORT }, "Kraken Portfolio API started");
   logger.info("Futures: GET /balances, /positions, /transactions");
   logger.info("Spot:    GET /spot/balances, /spot/positions, /spot/transactions");
   logger.info("Views:   GET /positions/view, /transactions/view, /spot/positions/view, /spot/transactions/view");

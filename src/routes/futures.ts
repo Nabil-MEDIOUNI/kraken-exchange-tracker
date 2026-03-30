@@ -37,7 +37,7 @@ export function createFuturesRouter() {
     if (accounts.cash) {
       const nonZero: Record<string, number> = {};
       for (const [cur, val] of Object.entries(accounts.cash.balances || {})) {
-        if (val > 0) nonZero[cur] = val;
+        if ((val as number) > 0) nonZero[cur] = val as number;
       }
       if (Object.keys(nonZero).length > 0) result.cash = nonZero;
     }

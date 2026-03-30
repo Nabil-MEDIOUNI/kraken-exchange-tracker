@@ -6,6 +6,7 @@ import { buildSpotTransactions } from "../utils/spot-transaction-builder.ts";
 import { buildSpotPositionsHTML } from "../views/positions-view.ts";
 import { buildSpotTransactionsHTML } from "../views/transactions-view.ts";
 import { TTLCache } from "../utils/cache.ts";
+import { logger } from "../utils/logger.ts";
 import type { NormalizedPosition, SpotTransaction } from "../types/common.ts";
 import type { SpotTrade } from "../types/kraken.ts";
 
@@ -62,23 +63,30 @@ export function createSpotRouter() {
   const positionsCache = new TTLCache<NormalizedPosition[]>(5 * 60 * 1000);
   const transactionsCache = new TTLCache<SpotTransaction[]>(5 * 60 * 1000);
 
+  const logProgress = (msg: string) => logger.info(msg);
+
   async function fetchPositions(): Promise<NormalizedPosition[]> {
     const cached = positionsCache.get("positions");
     if (cached) return cached;
-    const allTrades = await client.fetchAllTrades();
+    logProgress("Fetching spot positions...");
+    const allTrades = await client.fetchAllTrades({}, logProgress);
     const positions = buildSpotPositionsList(Object.values(allTrades));
     positionsCache.set("positions", positions);
+    logProgress(`Spot positions ready: ${positions.length} positions`);
     return positions;
   }
 
   async function fetchTransactions(): Promise<SpotTransaction[]> {
     const cached = transactionsCache.get("transactions");
     if (cached) return cached;
-    const ledgers = await client.fetchAllLedgers();
+    logProgress("Fetching spot transactions (this may take ~30s)...");
+    const ledgers = await client.fetchAllLedgers({}, logProgress);
     await sleep(3000);
-    const trades = await client.fetchAllTrades();
+    const trades = await client.fetchAllTrades({}, logProgress);
+    logProgress("Building transaction history with FIFO cost basis...");
     const transactions = await buildSpotTransactions(ledgers, trades, { normalizeAsset, parsePair });
     transactionsCache.set("transactions", transactions);
+    logProgress(`Spot transactions ready: ${transactions.length} transactions`);
     return transactions;
   }
 

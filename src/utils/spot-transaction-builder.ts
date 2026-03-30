@@ -25,30 +25,38 @@ function fmtAmt(val: string | number): string {
 interface Lot {
   qty: number;
   cpu: number;
+  date: number; // acquisition timestamp (seconds)
+}
+
+interface ConsumeResult {
+  cost: number;
+  earliestLotDate: number; // oldest FIFO lot used
 }
 
 function createLotTracker() {
   const lots: Record<string, Lot[]> = {};
 
-  function addLot(asset: string, qty: number, totalCost: number): void {
+  function addLot(asset: string, qty: number, totalCost: number, date: number): void {
     if (qty <= 0) return;
     if (!lots[asset]) lots[asset] = [];
-    lots[asset].push({ qty, cpu: totalCost / qty });
+    lots[asset].push({ qty, cpu: totalCost / qty, date });
   }
 
-  function consumeLots(asset: string, qty: number): number {
-    if (!lots[asset] || qty <= 0) return 0;
+  function consumeLots(asset: string, qty: number): ConsumeResult {
+    if (!lots[asset] || qty <= 0) return { cost: 0, earliestLotDate: 0 };
     let rem = qty;
     let cost = 0;
+    let earliestLotDate = Infinity;
     while (rem > 1e-12 && lots[asset].length > 0) {
       const lot = lots[asset][0];
       const take = Math.min(rem, lot.qty);
       cost += take * lot.cpu;
+      if (lot.date < earliestLotDate) earliestLotDate = lot.date;
       lot.qty -= take;
       rem -= take;
       if (lot.qty < 1e-12) lots[asset].shift();
     }
-    return parseFloat(cost.toFixed(10));
+    return { cost: parseFloat(cost.toFixed(10)), earliestLotDate: earliestLotDate === Infinity ? 0 : earliestLotDate };
   }
 
   return { addLot, consumeLots };
@@ -208,21 +216,23 @@ export async function buildSpotTransactions(
       const feeValueEur = feeInCrypto ? feeAmount * price : feeAmount;
 
       let fromCB: number, toCB: number, gain: number;
+      let costBasisDate = 0;
       if (isBuy) {
         const totalCost = cost + feeValueEur;
-        addLot(base, vol, totalCost);
-        if (feeInCrypto) { const feeCB = consumeLots(base, feeAmount); fromCB = feeCB; gain = -(feeCB - feeValueEur); }
+        addLot(base, vol, totalCost, trade.time);
+        if (feeInCrypto) { const feeResult = consumeLots(base, feeAmount); fromCB = feeResult.cost; gain = -(feeResult.cost - feeValueEur); }
         else { fromCB = 0; gain = 0; }
         toCB = totalCost;
       } else {
-        const soldCB = consumeLots(base, vol);
-        fromCB = soldCB; toCB = 0; gain = cost - soldCB - feeValueEur;
+        const sellResult = consumeLots(base, vol);
+        fromCB = sellResult.cost; toCB = 0; gain = cost - sellResult.cost - feeValueEur;
+        costBasisDate = sellResult.earliestLotDate;
       }
 
       transactions.push({
         id: txid, type: isBuy ? "buy" : "sell", date: truncDate(trade.time),
         description: null, label: null, txhash: txid,
-        from: { amount: fmtAmt(isBuy ? trade.cost : trade.vol), currency: { symbol: isBuy ? quote : base }, cost_basis: fmtVal(fromCB) },
+        from: { amount: fmtAmt(isBuy ? trade.cost : trade.vol), currency: { symbol: isBuy ? quote : base }, cost_basis: fmtVal(fromCB), ...(costBasisDate > 0 ? { cost_basis_date: truncDate(costBasisDate) } : {}) },
         to: { amount: fmtAmt(isBuy ? trade.vol : trade.cost), currency: { symbol: isBuy ? base : quote }, cost_basis: fmtVal(toCB) },
         fee: { amount: fmtAmt(feeAmount), currency: { symbol: feeCurrency } },
         net_value: fmtVal(cost), fee_value: fmtVal(feeValueEur), gain: fmtVal(gain),
@@ -251,7 +261,7 @@ export async function buildSpotTransactions(
         } else {
           const eurPrice = await getEurPrice(symbol, entry.time);
           const eurValue = totalAmt * eurPrice;
-          addLot(symbol, totalAmt, eurValue);
+          addLot(symbol, totalAmt, eurValue, entry.time);
           tx = makeTx({ id, type: "crypto_deposit", date,
             to: { amount: fmtAmt(totalAmt), currency: { symbol }, cost_basis: fmtVal(eurValue) },
             net_value: fmtVal(eurValue) });
@@ -265,12 +275,12 @@ export async function buildSpotTransactions(
             from: { amount: fmtAmt(totalAmt), currency: { symbol }, cost_basis: "0.0" },
             net_value: fmtVal(netVal) });
         } else {
-          const costBasis = consumeLots(symbol, totalAmt);
+          const wdResult = consumeLots(symbol, totalAmt);
           const eurPrice = await getEurPrice(symbol, entry.time);
           const eurValue = totalAmt * eurPrice;
           tx = makeTx({ id, type: "crypto_withdrawal", date,
-            from: { amount: fmtAmt(totalAmt), currency: { symbol }, cost_basis: fmtVal(costBasis) },
-            net_value: fmtVal(eurValue), gain: fmtVal(eurValue - costBasis) });
+            from: { amount: fmtAmt(totalAmt), currency: { symbol }, cost_basis: fmtVal(wdResult.cost) },
+            net_value: fmtVal(eurValue), gain: fmtVal(eurValue - wdResult.cost) });
         }
       } else if (entry.type === "margin") {
         const netPnl = amount - fee;
@@ -302,23 +312,40 @@ export async function buildSpotTransactions(
           const spentAmt = Math.abs(parseFloat(spend.amount));
           const spentFee = parseFloat(spend.fee);
           const spentSymbol = normalizeAsset(spend.asset);
-          const totalSpent = spentAmt + spentFee;
-          addLot(symbol, abs, totalSpent);
+          // The EUR value of what was received = cost basis for new lot
+          const eurPrice = await getEurPrice(symbol, entry.time);
+          const receivedEurValue = abs * eurPrice;
+          // Consume FIFO lots for the spent crypto to compute gain
+          const spendResult = consumeLots(spentSymbol, spentAmt);
+          const spentCostBasis = spendResult.cost;
+          const spentEurPrice = await getEurPrice(spentSymbol, entry.time);
+          const spentFmv = spentAmt * spentEurPrice;
+          const feeEurValue = spentFee * spentEurPrice;
+          const swapGain = spentFmv - spentCostBasis - feeEurValue;
+          // Add new lot for received asset
+          addLot(symbol, abs, receivedEurValue, entry.time);
           tx = {
-            id, type: "buy", date, description: null, label: null, txhash: entry.refid,
-            from: { amount: fmtAmt(spentAmt), currency: { symbol: spentSymbol }, cost_basis: fmtVal(spentFee) },
-            to: { amount: fmtAmt(abs), currency: { symbol }, cost_basis: fmtVal(totalSpent) },
+            id, type: "buy", date, description: null, label: "crypto_swap", txhash: entry.refid,
+            from: { amount: fmtAmt(spentAmt), currency: { symbol: spentSymbol }, cost_basis: fmtVal(spentCostBasis), ...(spendResult.earliestLotDate > 0 ? { cost_basis_date: truncDate(spendResult.earliestLotDate) } : {}) },
+            to: { amount: fmtAmt(abs), currency: { symbol }, cost_basis: fmtVal(receivedEurValue) },
             fee: { amount: fmtAmt(spentFee), currency: { symbol: spentSymbol } },
-            net_value: fmtVal(spentAmt), fee_value: fmtVal(spentFee), gain: "0.0",
+            net_value: fmtVal(spentFmv), fee_value: fmtVal(feeEurValue), gain: fmtVal(swapGain),
           };
         }
       } else if (entry.type === "spend") {
       } else if (entry.type === "staking") {
         const isIncoming = amount >= 0;
+        // For incoming staking rewards, compute EUR fair market value and add as lot
+        let eurValue = abs;
+        if (!isFiat) {
+          const eurPrice = await getEurPrice(symbol, entry.time);
+          eurValue = abs * eurPrice;
+          if (isIncoming) addLot(symbol, abs, eurValue, entry.time);
+        }
         const side = isIncoming
-          ? { to: { amount: fmtAmt(abs), currency: { symbol }, cost_basis: "0.0" } as CurrencyAmount }
+          ? { to: { amount: fmtAmt(abs), currency: { symbol }, cost_basis: fmtVal(eurValue) } as CurrencyAmount }
           : { from: { amount: fmtAmt(abs), currency: { symbol }, cost_basis: "0.0" } as CurrencyAmount };
-        tx = makeTx({ id, type: isIncoming ? "crypto_deposit" : "crypto_withdrawal", date, label: "staking", ...side, net_value: fmtVal(abs) });
+        tx = makeTx({ id, type: isIncoming ? "crypto_deposit" : "crypto_withdrawal", date, label: "staking", ...side, net_value: fmtVal(eurValue) });
       } else if (entry.type === "transfer") {
         const isIncoming = amount > 0;
         let netVal = abs;

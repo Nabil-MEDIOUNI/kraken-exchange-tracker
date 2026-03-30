@@ -7,6 +7,7 @@ export interface CurrencyAmount {
   amount: string;
   currency: { symbol: string };
   cost_basis?: string;
+  cost_basis_date?: string; // ISO date of earliest FIFO lot used (for holding period check)
 }
 
 export type Side = "Long" | "Short";
